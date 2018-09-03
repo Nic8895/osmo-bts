@@ -866,6 +866,7 @@ int lchan_meas_process_measurement(struct gsm_lchan *lchan, struct bts_ul_meas *
 		 * and add the uplink measurement we got as the first sample
 		 * of a new interval */
 		lchan_meas_check_compute(lchan, fn_missed_end);
+	        rsl_push_meas_res(lchan);
 		lchan_new_ul_meas(lchan, ulm, fn);
 
 		/* Report to the caller that we missed an inverval end

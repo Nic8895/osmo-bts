@@ -2590,6 +2590,7 @@ static int rsl_tx_meas_res(struct gsm_lchan *lchan, uint8_t *l3, int l3_len, con
 	uint8_t chan_nr = gsm_lchan2chan_nr(lchan);
 	int res_valid = lchan->meas.flags & LC_UL_M_F_RES_VALID;
 	struct gsm_bts *bts = lchan->ts->trx->bts;
+	int timing_offset = -1;
 
 	LOGP(DRSL, LOGL_DEBUG,
 	     "%s chan_num:%u Tx MEAS RES valid(%d), flags(%02x)\n",
@@ -2602,8 +2603,10 @@ static int rsl_tx_meas_res(struct gsm_lchan *lchan, uint8_t *l3, int l3_len, con
 	if (!msg)
 		return -ENOMEM;
 
+	if (le)
+		timing_offset = ms_to2rsl(lchan, le) - MEAS_MAX_TIMING_ADVANCE;
 	LOGP(DRSL, LOGL_DEBUG,
-	     "%s Send Meas RES: NUM:%u, RXLEV_FULL:%u, RXLEV_SUB:%u, RXQUAL_FULL:%u, RXQUAL_SUB:%u, MS_PWR:%u, UL_TA:%u, L3_LEN:%d, TimingOff:%u\n",
+	     "%s Send Meas RES: NUM:%u, RXLEV_FULL:%u, RXLEV_SUB:%u, RXQUAL_FULL:%u, RXQUAL_SUB:%u, MS_PWR:%u, UL_TA:%u, L3_LEN:%d, TimingOff:%i\n",
 	     gsm_lchan_name(lchan),
 	     lchan->meas.res_nr,
 	     lchan->meas.ul_res.full.rx_lev,
@@ -2611,7 +2614,7 @@ static int rsl_tx_meas_res(struct gsm_lchan *lchan, uint8_t *l3, int l3_len, con
 	     lchan->meas.ul_res.full.rx_qual,
 	     lchan->meas.ul_res.sub.rx_qual,
 	     lchan->meas.l1_info[0],
-	     lchan->meas.l1_info[1], l3_len, ms_to2rsl(lchan, le) - MEAS_MAX_TIMING_ADVANCE);
+	     lchan->meas.l1_info[1], l3_len, timing_offset);
 
 	msgb_tv_put(msg, RSL_IE_MEAS_RES_NR, lchan->meas.res_nr++);
 	size_t ie_len = gsm0858_rsl_ul_meas_enc(&lchan->meas.ul_res,
@@ -2641,13 +2644,26 @@ static int rsl_tx_meas_res(struct gsm_lchan *lchan, uint8_t *l3, int l3_len, con
 		lchan->meas.flags &= ~LC_UL_M_F_RES_VALID;
 	}
 	msgb_tv_put(msg, RSL_IE_BS_POWER, lchan->meas.bts_tx_pwr);
+
+	/* NOTE: In the following we will add measurement results that depend
+	 * on valid L1 and L3 messages from the MS. If we lost the last SACCH
+	 * block we do not have this info. For those cases we will leave out
+	 * L1 info, L3 info and MS timing offset but we will still reset the
+	 * related flags just to be sure. See also: 3GPP TS 08.58,
+	 * chapter 8.4.8 MEASUREMENT RESULT */
 	if (lchan->meas.flags & LC_UL_M_F_L1_VALID) {
-		msgb_tv_fixed_put(msg, RSL_IE_L1_INFO, 2, lchan->meas.l1_info);
+		if (l3 && l3_len > 0)
+			msgb_tv_fixed_put(msg, RSL_IE_L1_INFO, 2,
+					  lchan->meas.l1_info);
 		lchan->meas.flags &= ~LC_UL_M_F_L1_VALID;
 	}
-	msgb_tl16v_put(msg, RSL_IE_L3_INFO, l3_len, l3);
+
+	if (l3 && l3_len > 0)
+		msgb_tl16v_put(msg, RSL_IE_L3_INFO, l3_len, l3);
 	if (ms_to_valid(lchan)) {
-		msgb_tv_put(msg, RSL_IE_MS_TIMING_OFFSET, ms_to2rsl(lchan, le));
+		if (l3 && l3_len > 0 && le)
+			msgb_tv_put(msg, RSL_IE_MS_TIMING_OFFSET,
+				    ms_to2rsl(lchan, le));
 		lchan->ms_t_offs = -1;
 		lchan->p_offs = -1;
 	}
@@ -2656,6 +2672,15 @@ static int rsl_tx_meas_res(struct gsm_lchan *lchan, uint8_t *l3, int l3_len, con
 	msg->trx = lchan->ts->trx;
 
 	return abis_bts_rsl_sendmsg(msg);
+}
+
+/* forcefully push a measurement report to RSL. This is called by measurement.c,
+ * when it detects that a SACCH block was lost. The report will then only
+ * contain the measurement data from the BTS since the measurement data from
+ * the MS is lost in those cases */
+void rsl_push_meas_res(struct gsm_lchan *lchan)
+{
+	rsl_tx_meas_res(lchan, NULL, 0, NULL);
 }
 
 /* call-back for LAPDm code, called when it wants to send msgs UP */
