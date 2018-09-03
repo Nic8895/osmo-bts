@@ -240,32 +240,6 @@ static uint8_t translate_tch_meas_rep_fn104(uint8_t fn_mod)
 	return 0;
 }
 
-/* Same as above, but the inverse function */
-static uint8_t translate_tch_meas_rep_fn104_inv(uint8_t fn_mod)
-{
-	switch (fn_mod) {
-	case 103:
-		return 25;
-	case 12:
-		return 38;
-	case 25:
-		return 51;
-	case 38:
-		return 64;
-	case 51:
-		return 77;
-	case 64:
-		return 90;
-	case 77:
-		return 103;
-	case 90:
-		return 12;
-	}
-
-	/* Invalid / not of interest */
-	return 0;
-}
-
 /* determine if a measurement period ends at the given frame number
  * (this function is only used internally, it is public to call it from
  * unit-tests) */
@@ -322,6 +296,41 @@ int is_meas_complete(struct gsm_lchan *lchan, uint32_t fn)
 	return rc;
 }
 
+/* The measurement indications of voice blocks are not received in order with
+ * the measurement indications of the SACCH blocks. In relation to the normal
+ * voice blocks the The SACCH block that concludes the measurement interval is
+ * received 26 frames earlier than its frame number would indicate. In order
+ * to simplify the computation that detects if a SACCH frame was missed or not
+ * we subtract 26 from all SACCH frame numbers. This function MUST only be used
+ * with TCH/H and TCH/F channels. */
+static uint32_t fn_demangle(uint32_t fn)
+{
+	uint8_t rc;
+
+	/* Since a similar problem exists in is_meas_complete(), we can borrow
+	 * from there. translate_tch_meas_rep_fn104() returns 0 if the frame
+	 * number does not belong to a SACCH frame */
+	rc = translate_tch_meas_rep_fn104(fn % 104);
+
+	if (rc > 0 && fn >= 26)
+		return fn - 26;
+	else if (rc > 0)
+		return GSM_MAX_FN - (26 - fn);
+
+	return fn;
+}
+
+/* Inverse function of fn_demangle to convert the resulting fn back, this
+ * function must only be used with frame numbers that fall onto a SACCH
+ * interval end. It also must be a frame number from a TCH/H or a TCH/F. */
+static uint32_t fn_mangle(uint32_t fn)
+{
+	if (fn <= GSM_MAX_FN - 26)
+		return fn + 26;
+	else
+		return fn - (GSM_MAX_FN - 26);
+}
+
 /* Check if a measurement period is overdue. This situation may occur when the
  * SACCH frame that closes the measurement interval was not received. Then the
  * end of the measurement will not be detected. Using this function we can
@@ -332,6 +341,7 @@ bool is_meas_overdue(struct gsm_lchan *lchan, uint32_t *fn_missed_end, uint32_t 
 {
 	uint32_t fn_mod;
 	uint32_t last_fn_mod;
+	uint32_t last_fn;
 	uint32_t fn_rounded;
 	uint8_t interval_end;
 	uint8_t modulus;
@@ -349,7 +359,8 @@ bool is_meas_overdue(struct gsm_lchan *lchan, uint32_t *fn_missed_end, uint32_t 
 	case GSM_PCHAN_TCH_F:
 		modulus = 104;
 		interval_end = tchf_meas_rep_fn104_by_ts[lchan->ts->nr];
-		interval_end = translate_tch_meas_rep_fn104_inv(interval_end);
+		fn = fn_demangle(fn);
+		last_fn = fn_demangle(lchan->meas.last_fn);
 		break;
 	case GSM_PCHAN_TCH_H:
 		modulus = 104;
@@ -358,17 +369,20 @@ bool is_meas_overdue(struct gsm_lchan *lchan, uint32_t *fn_missed_end, uint32_t 
 		else
 			tbl = tchh1_meas_rep_fn104_by_ts;
 		interval_end = tbl[lchan->ts->nr];
-		interval_end = translate_tch_meas_rep_fn104_inv(interval_end);
+		fn = fn_demangle(fn);
+		last_fn = fn_demangle(lchan->meas.last_fn);
 		break;
 	case GSM_PCHAN_SDCCH8_SACCH8C:
 	case GSM_PCHAN_SDCCH8_SACCH8C_CBCH:
 		modulus = 102;
 		interval_end = sdcch8_meas_rep_fn102_by_ss[lchan->nr];
+		last_fn = lchan->meas.last_fn;
 		break;
 	case GSM_PCHAN_CCCH_SDCCH4:
 	case GSM_PCHAN_CCCH_SDCCH4_CBCH:
 		modulus = 102;
 		interval_end = sdcch4_meas_rep_fn102_by_ss[lchan->nr];
+		last_fn = lchan->meas.last_fn;
 		break;
 	default:
 		return false;
@@ -376,7 +390,7 @@ bool is_meas_overdue(struct gsm_lchan *lchan, uint32_t *fn_missed_end, uint32_t 
 	}
 
 	fn_mod = fn % modulus;
-	last_fn_mod = lchan->meas.last_fn % modulus;
+	last_fn_mod = last_fn % modulus;
 	fn_rounded = fn - fn_mod;
 
 	if (fn_mod > last_fn_mod) {
@@ -386,6 +400,8 @@ bool is_meas_overdue(struct gsm_lchan *lchan, uint32_t *fn_missed_end, uint32_t 
 		 * position on which the interval should have ended. */
 		if (interval_end > last_fn_mod && interval_end < fn_mod) {
 			*fn_missed_end = interval_end + fn_rounded;
+			if(modulus == 104)
+				*fn_missed_end = fn_mangle(*fn_missed_end);
 			return true;
 		}
 	} else {
@@ -395,19 +411,23 @@ bool is_meas_overdue(struct gsm_lchan *lchan, uint32_t *fn_missed_end, uint32_t 
 		 * that starts at the current frame number and ends at the
 		 * interval end. */
 		if (interval_end > last_fn_mod) {
-			if (fn < lchan->meas.last_fn)
+			if (fn < last_fn)
 				*fn_missed_end = interval_end + GSM_MAX_FN - modulus;
 			else
 				*fn_missed_end = interval_end + fn_rounded - modulus;
+			if(modulus == 104)
+				*fn_missed_end = fn_mangle(*fn_missed_end);
 			return true;
 		}
 		/* We also check the section that starts from the beginning of
 		 * the interval and ends at the current frame number. */
 		if (interval_end < fn_mod) {
-			if (fn < lchan->meas.last_fn)
+			if (fn < last_fn)
 				*fn_missed_end = interval_end;
 			else
 				*fn_missed_end = interval_end + fn_rounded;
+			if(modulus == 104)
+				*fn_missed_end = fn_mangle(*fn_missed_end);
 			return true;
 		}
 	}
@@ -825,10 +845,11 @@ int lchan_meas_check_compute(struct gsm_lchan *lchan, uint32_t fn)
  * l1sap.c every time a measurement indication is received. It collects the
  * measurement samples and automatically detects the end oft the measurement
  * interval. */
-void lchan_meas_process_measurement(struct gsm_lchan *lchan, struct bts_ul_meas *ulm, uint32_t fn)
+int lchan_meas_process_measurement(struct gsm_lchan *lchan, struct bts_ul_meas *ulm, uint32_t fn)
 {
 	uint32_t fn_missed_end;
 	bool missed_end;
+	int rc;
 
 	/* The measurement processing detects the end of a measurement period
 	 * by checking if the received measurement sample is from a SACCH
@@ -846,12 +867,22 @@ void lchan_meas_process_measurement(struct gsm_lchan *lchan, struct bts_ul_meas 
 		 * of a new interval */
 		lchan_meas_check_compute(lchan, fn_missed_end);
 		lchan_new_ul_meas(lchan, ulm, fn);
+
+		/* Report to the caller that we missed an inverval end
+		 * (unit-test) */
+		rc = 1;
 	} else {
 		/* This is the normal case, we first add the measurement sample
 		 * to the current interva and run the check+computation */
 		lchan_new_ul_meas(lchan, ulm, fn);
 		lchan_meas_check_compute(lchan, fn);
+
+		/* Report to the caller that the measurement was processed
+		 * normally (unit-test) */
+		rc = 0;
 	}
+
+	return rc;
 }
 
 /* Reset all measurement related struct members to their initial values. This
